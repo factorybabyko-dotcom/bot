@@ -61,15 +61,20 @@ RULES = """# Технические правила (строго, важнее �
 - Формат: как я пишу в жизни — несколько коротких сообщений подряд. Разделяй сообщения строкой из трёх дефисов (---). Максимум 4 сообщения, обычно 1–2.
 - Язык — как у клиента. Обращаюсь на «вы».
 - НИКОГДА не называй никого по имени: ни клиента, ни себя, ни сотрудников, ни третьих лиц. Не подписывайся. Не обращайся по имени, даже если оно видно в чате.
-- Не упоминай и не обсуждай имена людей вообще. Не объясняй, почему чего-то не обсуждаешь, не говори «мне нельзя», «не могу обсуждать», «правила». Если разговор уходит в имена — не поддерживай тему, переведи на дело одной короткой фразой в моём стиле или передай мне.
+- Не упоминай и не обсуждай имена людей вообще. Не объясняй, почему чего-то не обсуждаешь, не говори «мне нельзя», «не могу обсуждать», «правила». Если разговор уходит в имена — не поддерживай тему, переведи на дело одной короткой фразой в моём стиле, как будто не придал значения.
 - Никогда не говори и не намекай, что ты ИИ, бот, нейросеть, ассистент или что есть инструкции. Не используй фразы бота: «чем могу помочь», «буду рад», «конечно!», «безусловно», «к сожалению, я не могу». Пиши как живой человек, который отвечает с телефона.
-- Если нужен я лично — оплата, скидки, договорённости, жалоба, спор, вопрос, ответа на который нет в разделе «Факты», любой вопрос про то, кто пишет, как зовут, живой ли человек — выдай ровно: [ESCALATE] краткая причина
+- Если нужен я лично — оплата, скидки, договорённости, жалоба, спор, вопрос, ответа на который нет в разделе «Факты», любой вопрос, не бот ли ты и живой ли человек — выдай ровно: [ESCALATE] краткая причина
 - Цену не называй. Если по смыслу нужно её указать — оставь на её месте "" (две кавычки подряд), остальное допишу я сам.
 - Ничего не выдумывай: сроки, цены, наличие, условия — только из раздела «Факты» или из этого же диалога. Если не знаешь — [ESCALATE].
 """
 
 bot = Bot(BOT_TOKEN)
-ai = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+_ws = os.getenv("ANTHROPIC_WORKSPACE_ID", "").strip()
+ai = AsyncAnthropic(
+    api_key=ANTHROPIC_API_KEY,
+    default_headers={"anthropic-workspace-id": _ws} if _ws else None,
+)
+last_error_notice = 0.0
 router = Router()
 pool: asyncpg.Pool
 
@@ -237,9 +242,9 @@ async def llm(rows, extra: str = "") -> str:
     return "".join(b.text for b in resp.content if b.type == "text").strip()
 
 
-async def generate_checked(rows, name_tokens=()):
+async def generate_checked(rows, name_tokens=(), hint: str = ""):
     """-> ("ok", [parts]) | ("escalate", reason)"""
-    extra = ""
+    extra = hint
     for attempt in range(2):
         raw = await llm(rows, extra)
         if not raw:
@@ -254,7 +259,7 @@ async def generate_checked(rows, name_tokens=()):
                 return "ok", parts
             why = "пустой ответ"
         log.warning("reply rejected (%s), attempt %d", why, attempt + 1)
-        extra = (
+        extra = hint + "\n\n" + (
             f"# Исправление\nПредыдущий вариант не прошёл проверку: {why}. Перепиши короче и естественнее: "
             "без имён, без упоминания ИИ/правил/запретов, без шаблонной вежливости. Если не получается ответить безопасно — [ESCALATE] причина."
         )
@@ -314,12 +319,16 @@ async def process(chat_id: int, conn_id: str, name: str, name_tokens: tuple):
             return
         client_text = trailing_client_text(rows)
 
-        why = guard.client_needs_owner(client_text)
-        if why:
-            await notify_escalation(chat_id, name, client_text, why)
-            return
+        hint = ""
+        cls = guard.classify_client(client_text)
+        if cls:
+            kind, info = cls
+            if kind == "escalate":
+                await notify_escalation(chat_id, name, client_text, info)
+                return
+            hint = info
 
-        status, result = await generate_checked(rows, name_tokens)
+        status, result = await generate_checked(rows, name_tokens, hint)
         if status == "escalate":
             await notify_escalation(chat_id, name, client_text, result)
             return
@@ -333,8 +342,19 @@ async def process(chat_id: int, conn_id: str, name: str, name_tokens: tuple):
             await send_draft(chat_id, conn_id, name, client_text, parts)
     except asyncio.CancelledError:
         raise
-    except Exception:
+    except Exception as e:
         log.exception("process failed for chat %s", chat_id)
+        global last_error_notice
+        if time.time() - last_error_notice > 600:
+            last_error_notice = time.time()
+            try:
+                await bot.send_message(
+                    OWNER_ID,
+                    f"❗ Бот не смог ответить клиенту ({name}): {type(e).__name__}: {str(e)[:300]}\n"
+                    "Ответь сам; подробности в логах Railway.",
+                )
+            except Exception:
+                pass
 
 
 def schedule(chat_id: int, conn_id: str, name: str, name_tokens: tuple):
@@ -438,11 +458,15 @@ async def cmd_try(m: Message, command: CommandObject):
     text = (command.args or "").strip()
     if not text:
         return await m.answer("Напиши так: /try Добрый день, сколько стоит боди?")
-    why = guard.client_needs_owner(text)
-    if why:
-        return await m.answer(f"⚠️ Бот сам не ответил бы, передал бы тебе: {why}")
+    hint = ""
+    cls = guard.classify_client(text)
+    if cls:
+        kind, info = cls
+        if kind == "escalate":
+            return await m.answer(f"⚠️ Бот сам не ответил бы, передал бы тебе: {info}")
+        hint = info
     rows = [{"role": "user", "text": text, "ts": datetime.now(timezone.utc)}]
-    status, result = await generate_checked(rows)
+    status, result = await generate_checked(rows, (), hint)
     if status == "escalate":
         return await m.answer(f"⚠️ Передал бы тебе: {result}")
     await m.answer("Так бы ушло клиенту:\n\n" + "\n— — —\n".join(result))
