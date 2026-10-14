@@ -26,7 +26,20 @@ log = logging.getLogger("replybot")
 
 # ---------- config ----------
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-DATABASE_URL = os.environ["DATABASE_URL"]
+def _db_url() -> str:
+    url = (os.getenv("DATABASE_URL") or "").strip()
+    if url.startswith(("postgres://", "postgresql://")):
+        return url
+    h, u, pw, db = (os.getenv(k) for k in ("PGHOST", "PGUSER", "PGPASSWORD", "PGDATABASE"))
+    if h and u and pw and db:
+        return f"postgresql://{u}:{pw}@{h}:{os.getenv('PGPORT', '5432')}/{db}"
+    raise SystemExit(
+        "DATABASE_URL пустой или неверный (получено: %r). В Railway у сервиса бота: Variables -> "
+        "Add Reference -> сервис PostgreSQL -> DATABASE_URL." % url[:40]
+    )
+
+
+DATABASE_URL = _db_url()
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 OWNER_ID = int(os.environ["OWNER_ID"])  # твой Telegram user id
 MODEL = os.getenv("MODEL", "claude-sonnet-5-5")
