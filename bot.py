@@ -1,13 +1,16 @@
 import asyncio
+import io
 import json
 import logging
 import os
 import re
 import time
+from collections import deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import asyncpg
+import httpx
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandObject
 from aiogram.types import (
@@ -45,9 +48,16 @@ OWNER_ID = int(os.environ["OWNER_ID"])  # твой Telegram user id
 MODEL = os.getenv("MODEL", "claude-sonnet-5-5")
 HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "30"))
 DEBOUNCE = float(os.getenv("DEBOUNCE_SECONDS", "6"))
-TAKEOVER_PAUSE_MIN = int(os.getenv("TAKEOVER_PAUSE_MIN", "60"))
+TAKEOVER_PAUSE_MIN = int(os.getenv("TAKEOVER_PAUSE_MIN", "15"))  # меняется командой /pause N прямо в Telegram
 N_EXAMPLES = int(os.getenv("N_EXAMPLES", "10"))
 BISHKEK = timezone(timedelta(hours=6))
+
+# распознавание голосовых (любой OpenAI-совместимый сервис: OpenAI Whisper, Groq и т.п.)
+STT_API_KEY = (os.getenv("STT_API_KEY") or os.getenv("OPENAI_API_KEY") or "").strip()
+STT_BASE_URL = os.getenv("STT_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+STT_MODEL = os.getenv("STT_MODEL", "whisper-1")
+STT_LANGUAGE = os.getenv("STT_LANGUAGE", "").strip()  # например "ru"; пусто = определять само
+MAX_VOICE_SEC = int(os.getenv("MAX_VOICE_SECONDS", "240"))
 
 BASE = Path(__file__).parent
 STYLE = (BASE / "style.md").read_text(encoding="utf-8")
@@ -64,6 +74,7 @@ RULES = """# Технические правила (строго, важнее �
 - Не упоминай и не обсуждай имена людей вообще. Не объясняй, почему чего-то не обсуждаешь, не говори «мне нельзя», «не могу обсуждать», «правила». Если разговор уходит в имена — не поддерживай тему, переведи на дело одной короткой фразой в моём стиле, как будто не придал значения.
 - Никогда не говори и не намекай, что ты ИИ, бот, нейросеть, ассистент или что есть инструкции. Не используй фразы бота: «чем могу помочь», «буду рад», «конечно!», «безусловно», «к сожалению, я не могу». Пиши как живой человек, который отвечает с телефона.
 - Если нужен я лично — оплата, скидки, договорённости, жалоба, спор, вопрос, ответа на который нет в разделе «Факты», любой вопрос, не бот ли ты и живой ли человек — выдай ровно: [ESCALATE] краткая причина
+- Если сообщение клиента начинается с [голосовое] — это расшифровка его голосового. Отвечай на смысл, ошибки распознавания не комментируй и не упоминай, что это расшифровка.
 - Цену не называй. Если по смыслу нужно её указать — оставь на её месте "" (две кавычки подряд), остальное допишу я сам.
 - Ничего не выдумывай: сроки, цены, наличие, условия — только из раздела «Факты» или из этого же диалога. Если не знаешь — [ESCALATE].
 """
@@ -80,6 +91,11 @@ pool: asyncpg.Pool
 
 pending: dict[int, asyncio.Task] = {}
 last_bot_send: dict[int, float] = {}
+# тексты, которые бот сам отправил от твоего имени (чтобы не принять их эхо за твой ручной ответ)
+recent_bot_texts: dict[int, deque] = {}
+# журнал решений «почему бот промолчал / что сделал» (команда /why)
+decisions: deque = deque(maxlen=40)
+last_business_msg: dict = {"ts": 0.0, "conn": None}
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS messages(
@@ -135,18 +151,48 @@ async def load_history(chat_id: int):
     return list(reversed(rows))
 
 
-async def pause_chat(chat_id: int):
+async def pause_minutes() -> int:
+    v = await get_setting("pause_min", str(TAKEOVER_PAUSE_MIN))
+    try:
+        return max(0, int(v))
+    except ValueError:
+        return TAKEOVER_PAUSE_MIN
+
+
+async def pause_chat(chat_id: int, minutes: int) -> bool:
+    """True, если пауза началась только что (раньше чат не был на паузе)."""
+    was = await is_paused(chat_id)
     await pool.execute(
         "INSERT INTO chat_state(chat_id,paused_until) "
         "VALUES($1, now() + make_interval(mins => $2)) "
         "ON CONFLICT (chat_id) DO UPDATE SET paused_until=EXCLUDED.paused_until",
-        chat_id, TAKEOVER_PAUSE_MIN,
+        chat_id, minutes,
     )
+    return not was
 
 
 async def is_paused(chat_id: int) -> bool:
     v = await pool.fetchval("SELECT paused_until > now() FROM chat_state WHERE chat_id=$1", chat_id)
     return bool(v)
+
+
+def note(chat_id: int, name: str, what: str):
+    """Запоминаем, что бот решил по этому чату (видно в /why и в логах Railway)."""
+    log.info("decision chat=%s (%s): %s", chat_id, name, what)
+    decisions.append((datetime.now(BISHKEK), chat_id, name, what))
+
+
+async def notify_owner(text: str, **kw) -> bool:
+    """Пишет тебе в личку с ботом. Если не вышло, это видно в логах (раньше глоталось молча)."""
+    try:
+        await bot.send_message(OWNER_ID, text, **kw)
+        return True
+    except Exception as e:
+        log.error(
+            "НЕ МОГУ НАПИСАТЬ ВЛАДЕЛЬЦУ (OWNER_ID=%s): %s: %s. Проверь OWNER_ID и нажми /start у бота.",
+            OWNER_ID, type(e).__name__, e,
+        )
+        return False
 
 
 # ---------- prompt building ----------
@@ -275,6 +321,7 @@ async def send_as_owner(chat_id: int, conn_id: str, parts: list[str]):
             pass
         await asyncio.sleep(min(6.0, 0.8 + len(part) / 30) if i == 0 else min(4.0, 0.5 + len(part) / 40))
         last_bot_send[chat_id] = time.time()
+        recent_bot_texts.setdefault(chat_id, deque(maxlen=20)).append((time.time(), part.strip()))
         await bot.send_message(chat_id, part, business_connection_id=conn_id)
         last_bot_send[chat_id] = time.time()
         await save(chat_id, "assistant", part)
@@ -300,10 +347,82 @@ async def send_draft(chat_id: int, conn_id: str, name: str, client_text: str, pa
 
 
 async def notify_escalation(chat_id: int, name: str, client_text: str, reason: str):
-    await bot.send_message(
-        OWNER_ID,
-        f"⚠️ Нужен ты: {name} (tg://user?id={chat_id})\nПричина: {reason}\n\n{client_text}",
-    )
+    note(chat_id, name, f"передал тебе: {reason}")
+    await notify_owner(f"⚠️ Нужен ты: {name} (tg://user?id={chat_id})\nПричина: {reason}\n\n{client_text}")
+
+
+def is_bot_echo(chat_id: int, text: str | None) -> bool:
+    """Это эхо сообщения, которое бот сам отправил от твоего имени (а не твой ручной ответ)?"""
+    if not text:
+        return False
+    q = recent_bot_texts.get(chat_id)
+    if not q:
+        return False
+    now = time.time()
+    t = text.strip()
+    for item in list(q):
+        ts, sent = item
+        if now - ts > 180:
+            q.remove(item)
+        elif sent == t:
+            q.remove(item)
+            return True
+    return False
+
+
+# ---------- голосовые ----------
+def media_name_mime(m: Message) -> tuple[str, str]:
+    if m.video_note:
+        return "video.mp4", "video/mp4"
+    if m.audio:
+        mime = m.audio.mime_type or "audio/mpeg"
+        fn = m.audio.file_name or ""
+        if "." not in fn:
+            fn = "audio." + (mime.split("/")[-1].replace("mpeg", "mp3") or "mp3")
+        return fn, mime
+    return "voice.ogg", "audio/ogg"
+
+
+async def transcribe(file_id: str, filename: str, mime: str) -> str:
+    buf = io.BytesIO()
+    await bot.download(file_id, destination=buf)
+    data = {"model": STT_MODEL}
+    if STT_LANGUAGE:
+        data["language"] = STT_LANGUAGE
+    async with httpx.AsyncClient(timeout=90) as c:
+        r = await c.post(
+            f"{STT_BASE_URL}/audio/transcriptions",
+            headers={"Authorization": f"Bearer {STT_API_KEY}"},
+            data=data,
+            files={"file": (filename, buf.getvalue(), mime)},
+        )
+    r.raise_for_status()
+    return (r.json().get("text") or "").strip()
+
+
+async def client_content(m: Message) -> str:
+    """Текст сообщения клиента; голосовые расшифровываются. Неудача -> «[вложение: …]» (уйдёт тебе)."""
+    text = (m.text or m.caption or "").strip()
+    media = m.voice or m.audio or m.video_note
+    if not media:
+        return text or "[вложение: фото/файл]"
+    if not STT_API_KEY:
+        return "[вложение: голосовое, распознавание не настроено (нет STT_API_KEY)]"
+    if (getattr(media, "duration", 0) or 0) > MAX_VOICE_SEC:
+        return "[вложение: голосовое слишком длинное]"
+    try:
+        name, mime = media_name_mime(m)
+        heard = await transcribe(media.file_id, name, mime)
+    except Exception as e:
+        log.exception("transcribe failed")
+        why = f"{type(e).__name__}"
+        resp = getattr(e, "response", None)
+        if resp is not None:
+            why += f" {resp.status_code}"
+        return f"[вложение: голосовое не удалось расшифровать ({why}); проверь STT_API_KEY / STT_BASE_URL / STT_MODEL]"
+    if not heard:
+        return "[вложение: в голосовом не расслышал речь]"
+    return f"[голосовое] {heard}" + (f"\n{text}" if text else "")
 
 
 # ---------- core flow ----------
@@ -311,11 +430,17 @@ async def process(chat_id: int, conn_id: str, name: str, name_tokens: tuple):
     try:
         await asyncio.sleep(DEBOUNCE)
         if await get_setting("enabled", "1") != "1":
+            note(chat_id, name, "молчу: бот выключен (/off). Включить: /on")
             return
         if await is_paused(chat_id):
+            left = await pool.fetchval(
+                "SELECT ceil(extract(epoch FROM (paused_until - now())) / 60) FROM chat_state WHERE chat_id=$1", chat_id
+            )
+            note(chat_id, name, f"молчу: в чате пауза (ты писал сам), ещё ~{int(left or 0)} мин. Снять: /resume")
             return
         rows = await load_history(chat_id)
         if not rows or rows[-1]["role"] != "user":
+            note(chat_id, name, "молчу: последним в чате написал ты, отвечать не на что")
             return
         client_text = trailing_client_text(rows)
 
@@ -336,25 +461,25 @@ async def process(chat_id: int, conn_id: str, name: str, name_tokens: tuple):
         parts = result
         mode = await get_setting("mode", "draft")
         if mode == "auto" and not any('""' in p for p in parts):
+            note(chat_id, name, "отвечаю клиенту сам (режим /auto)")
             # отправку не отменяем, даже если пришло новое сообщение клиента
             await asyncio.shield(send_as_owner(chat_id, conn_id, parts))
         else:
+            why = "режим /draft" if mode != "auto" else "в ответе цена (\"\")"
+            note(chat_id, name, f"прислал тебе черновик ({why}), клиенту ничего не ушло")
             await send_draft(chat_id, conn_id, name, client_text, parts)
     except asyncio.CancelledError:
         raise
     except Exception as e:
         log.exception("process failed for chat %s", chat_id)
+        note(chat_id, name, f"ОШИБКА: {type(e).__name__}: {str(e)[:200]}")
         global last_error_notice
         if time.time() - last_error_notice > 600:
             last_error_notice = time.time()
-            try:
-                await bot.send_message(
-                    OWNER_ID,
-                    f"❗ Бот не смог ответить клиенту ({name}): {type(e).__name__}: {str(e)[:300]}\n"
-                    "Ответь сам; подробности в логах Railway.",
-                )
-            except Exception:
-                pass
+            await notify_owner(
+                f"❗ Бот не смог ответить клиенту ({name}): {type(e).__name__}: {str(e)[:300]}\n"
+                "Ответь сам; подробности в логах Railway."
+            )
 
 
 def schedule(chat_id: int, conn_id: str, name: str, name_tokens: tuple):
@@ -367,20 +492,40 @@ def schedule(chat_id: int, conn_id: str, name: str, name_tokens: tuple):
 @router.business_message()
 async def on_business_message(m: Message):
     chat_id = m.chat.id
-    text = m.text or m.caption
-    if m.from_user and m.from_user.id == OWNER_ID:
-        # это либо твой ручной ответ, либо эхо сообщения самого бота
-        if time.time() - last_bot_send.get(chat_id, 0) < 6:
-            return
+    last_business_msg["ts"] = time.time()
+    last_business_msg["conn"] = m.business_connection_id
+    from_owner = bool(m.from_user and m.from_user.id == OWNER_ID)
+    echo_flag = getattr(m, "sender_business_bot", None) is not None
+    log.info(
+        "business_message chat=%s from=%s from_owner=%s bot_echo_flag=%s type=%s",
+        chat_id, m.from_user.id if m.from_user else None, from_owner, echo_flag,
+        "voice" if m.voice else "video_note" if m.video_note else "audio" if m.audio else "text" if m.text else "other",
+    )
+    # эхо сообщений, которые отправил сам бот от твоего имени
+    if echo_flag:
+        return
+    if from_owner:
+        text = m.text or m.caption
+        if is_bot_echo(chat_id, text):
+            return  # это эхо моего же ответа, не твой ручной
+        # это твой ручной ответ из приложения Telegram
         t = pending.get(chat_id)
         if t and not t.done():
             t.cancel()
         if text:
             await save(chat_id, "assistant", text)
-        await pause_chat(chat_id)
+        minutes = await pause_minutes()
+        if minutes <= 0:
+            note(chat_id, "", "ты написал сам, пауза выключена (/pause 0), отвечу на следующее сообщение клиента")
+            return
+        if await pause_chat(chat_id, minutes):
+            note(chat_id, "", f"ты написал сам, чат на паузе {minutes} мин")
+            await notify_owner(
+                f"⏸ Бот молчит в этом чате {minutes} мин: ты написал сам со своего аккаунта.\n"
+                "Снять паузу: /resume. Изменить или выключить паузу: /pause 5 или /pause 0"
+            )
         return
-    if not text:
-        text = "[вложение: фото/файл/голосовое]"
+    text = await client_content(m)
     u = m.from_user
     name = u.full_name if u else "клиент"
     name_tokens = tuple(
@@ -414,7 +559,9 @@ async def cmd_id(m: Message):
 async def cmd_start(m: Message):
     await m.answer(
         "Команды:\n/draft — присылать черновики мне\n/auto — отвечать клиентам самому\n"
-        "/on /off — включить/выключить\n/status — состояние\n"
+        "/on /off — включить/выключить\n/status — состояние и проверка связи\n/why — почему бот молчал (последние решения)\n"
+        "/resume — снять паузу во всех чатах\n/pause N — на сколько минут бот замолкает, когда ты пишешь сам (0 = не замолкать)\n"
+        "Голосовое мне в личку — покажу расшифровку и как бы ответил клиенту\n"
         "/try текст — проверить, как бот ответит на такое сообщение клиента (никому не уходит)"
     )
 
@@ -447,10 +594,99 @@ async def cmd_off(m: Message):
 async def cmd_status(m: Message):
     mode = await get_setting("mode", "draft")
     en = await get_setting("enabled", "1")
-    await m.answer(
-        f"Включён: {'да' if en == '1' else 'нет'}\nРежим: {mode}\n"
-        f"Модель: {MODEL}\nПримеров стиля: {len(EXAMPLES)}"
+    minutes = await pause_minutes()
+    paused = await pool.fetch(
+        "SELECT chat_id, client_name, ceil(extract(epoch FROM (paused_until - now())) / 60) AS left "
+        "FROM chat_state WHERE paused_until > now()"
     )
+    lines = [
+        f"Включён: {'да' if en == '1' else 'нет'}",
+        f"Режим: {'авто (отвечаю сам)' if mode == 'auto' else 'черновики (клиентам не уходит без кнопки)'}",
+        f"Пауза после твоих сообщений: {minutes} мин" if minutes else "Пауза после твоих сообщений: выключена",
+        f"Чатов на паузе сейчас: {len(paused)}" + "".join(
+            f"\n  • {r['client_name'] or r['chat_id']}: ещё ~{int(r['left'])} мин" for r in paused
+        ),
+        f"Голосовые: {'расшифровываю (' + STT_MODEL + ')' if STT_API_KEY else 'НЕ настроены (нет STT_API_KEY)'}",
+        f"Модель: {MODEL}; примеров стиля: {len(EXAMPLES)}",
+    ]
+    if last_business_msg["ts"]:
+        ago = int(time.time() - last_business_msg["ts"])
+        lines.append(f"Последнее сообщение из бизнес-чатов получено {human_gap(timedelta(seconds=ago))} назад")
+        try:
+            bc = await bot.get_business_connection(last_business_msg["conn"])
+            rights = getattr(bc, "rights", None)
+            can_reply = getattr(rights, "can_reply", None) if rights is not None else getattr(bc, "can_reply", None)
+            lines.append(
+                f"Подключение: {'включено' if bc.is_enabled else 'ОТКЛЮЧЕНО'}; "
+                f"право отвечать: {'да' if can_reply else 'НЕТ (включи в Настройки → Telegram для бизнеса → Чат-боты)' if can_reply is not None else 'не удалось проверить'}"
+            )
+        except Exception as e:
+            lines.append(f"Подключение проверить не удалось: {type(e).__name__}")
+    else:
+        lines.append(
+            "С момента запуска бот не получил НИ ОДНОГО сообщения из бизнес-чатов. Проверь: Настройки → Telegram для бизнеса → "
+            "Чат-боты: бот выбран, нужный чат не в исключениях, включено «Отвечать на сообщения»."
+        )
+    await m.answer("\n".join(lines))
+
+
+@router.message(Command("why"), owner)
+async def cmd_why(m: Message):
+    if not decisions:
+        return await m.answer(
+            "Пока пусто: с момента запуска бот не принял ни одного решения по клиентским сообщениям. "
+            "Значит, сообщения до него не доходят. Смотри /status."
+        )
+    out = []
+    for ts, chat_id, name, what in list(decisions)[-12:]:
+        who = f" {name}" if name else ""
+        out.append(f"{ts:%H:%M:%S}{who} [{chat_id}]: {what}")
+    await m.answer("Последние решения бота:\n\n" + "\n".join(out))
+
+
+@router.message(Command("pause"), owner)
+async def cmd_pause(m: Message, command: CommandObject):
+    arg = (command.args or "").strip()
+    if not arg:
+        n = await pause_minutes()
+        return await m.answer(
+            f"Сейчас: {n} мин. Когда ты пишешь клиенту сам, бот молчит в этом чате столько минут.\n"
+            "Изменить: /pause 5. Не замолкать вообще: /pause 0."
+        )
+    if not arg.isdigit() or int(arg) > 1440:
+        return await m.answer("Напиши число минут от 0 до 1440, например /pause 10")
+    await set_setting("pause_min", arg)
+    await m.answer("Пауза выключена: бот не замолкает, когда ты пишешь сам." if arg == "0" else f"Пауза после твоих сообщений: {arg} мин.")
+
+
+@router.message(Command("resume"), owner)
+async def cmd_resume(m: Message):
+    n = await pool.fetchval("SELECT count(*) FROM chat_state WHERE paused_until > now()")
+    await pool.execute("UPDATE chat_state SET paused_until=NULL")
+    await m.answer(f"▶️ Пауза снята во всех чатах (было на паузе: {n}).")
+
+
+@router.message(owner, F.voice | F.video_note | F.audio)
+async def owner_voice_test(m: Message):
+    """Тест голосовых: пришли боту голосовое в личку, он покажет расшифровку и как бы ответил."""
+    if not STT_API_KEY:
+        return await m.answer("Распознавание не настроено: добавь в Railway переменную STT_API_KEY (см. README).")
+    text = await client_content(m)
+    if text.startswith("[вложение"):
+        return await m.answer("⚠️ " + text)
+    await m.answer("🎙 Расшифровка:\n" + text.replace("[голосовое] ", "", 1))
+    cls = guard.classify_client(text)
+    hint = ""
+    if cls:
+        kind, info = cls
+        if kind == "escalate":
+            return await m.answer(f"⚠️ Бот сам не ответил бы, передал бы тебе: {info}")
+        hint = info
+    rows = [{"role": "user", "text": text, "ts": datetime.now(timezone.utc)}]
+    status, result = await generate_checked(rows, (), hint)
+    if status == "escalate":
+        return await m.answer(f"⚠️ Передал бы тебе: {result}")
+    await m.answer("Так бы ушло клиенту:\n\n" + "\n— — —\n".join(result))
 
 
 @router.message(Command("try"), owner)
@@ -515,6 +751,12 @@ async def main():
     dp.include_router(router)
     await bot.delete_webhook(drop_pending_updates=False)
     log.info("started, model=%s, examples=%d", MODEL, len(EXAMPLES))
+    ok = await notify_owner(
+        f"✅ Бот запущен. Режим: {await get_setting('mode', 'draft')}. "
+        f"Голосовые: {'да' if STT_API_KEY else 'нет (нет STT_API_KEY)'}. Проверка связи: /status"
+    )
+    if not ok:
+        log.error("Владелец не получает сообщения от бота: проверь OWNER_ID и нажми /start в чате с ботом.")
     await dp.start_polling(
         bot,
         allowed_updates=["message", "callback_query", "business_connection", "business_message"],
