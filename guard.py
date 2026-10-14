@@ -173,12 +173,11 @@ def classify_client(text: str):
     if ATTACH_ONLY.match(n.strip()):
         return "escalate", "клиент прислал только вложение (фото/файл/голосовое)"
     if AI_ASK.search(n):
-        # не отшучиваемся и не отрицаем: клиенту уйдёт нейтральное «минуту», а ответить должен ты сам
         return "stall", "спрашивают, бот ли это"
     if INJECTION.search(n):
         return "confused", INJECTION_HINT
     if mentions_forbidden(n) or NAME_ASK.search(n):
         return "deflect", DEFLECT_HINT
-    if any(t.startswith("адилет") for t in WORD.findall(n)):
+    if any(t.startswith("Адилет") for t in WORD.findall(n)):
         return "addressed", ADDRESSED_HINT
     return None
